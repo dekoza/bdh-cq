@@ -58,7 +58,9 @@ class LinearAttention(Module):
     def forward(
         self,
         tokens,
-        rotary_emb = None
+        memories = None,
+        rotary_emb = None,
+        return_memories = False
     ):
         device = tokens.device
 
@@ -93,11 +95,24 @@ class LinearAttention(Module):
 
         agg = einsum('b h i j, b h j d -> b h i d', attn, v)
 
+        # past memories
+
+        if exists(memories):
+            retrieved = einsum('b h n d, b h d e -> b h n e', q, memories)
+            agg = agg + retrieved
+
         # out
 
         out = self.merge_heads(agg)
 
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if not return_memories:
+            return out
+
+        memories = einsum('b h n d, b h n e -> b h d e', k, v)
+
+        return out, memories
 
 class BDH(Module):
     def __init__(
@@ -137,22 +152,44 @@ class BDH(Module):
 
     def forward(
         self,
-        ids
+        ids,
+        memories = None,
+        return_memory = False
     ):
         tokens = self.token_embed(ids)
 
-        seq_len, device = tokens.shape[-2], tokens.device
+        seq_len, depth, device = tokens.shape[-2], self.depth, tokens.device
+
+        # positions
 
         seq = torch.arange(seq_len, device = device)
 
         pos_emb = self.rope(seq)
 
-        for _ in range(self.depth):
-            layer_out = self.layer(tokens, pos_emb)
+        # memories
+
+        memories = iter(default(memories, (None,) * depth))
+        next_memories = []
+
+        # layers
+
+        for _ in range(depth):
+            layer_out, layer_memory = self.layer(tokens, memories = next(memories, None), rotary_emb = pos_emb, return_memories = True)
+
             tokens = self.postnorm(tokens + layer_out)
 
+            next_memories.append(layer_memory)
+
+        # readout
+
         logits = self.to_logits(tokens)
-        return logits
+
+        # return
+
+        if not return_memory:
+            return logits
+
+        return logits, next_memories
 
 # quick test
 
