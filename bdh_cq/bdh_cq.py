@@ -3,9 +3,12 @@ from __future__ import annotations
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList, Embedding, Linear, Sequential, RMSNorm
+from torch.nn import Module, ModuleList, Embedding, Linear, LayerNorm, Sequential, RMSNorm
 
 from einops import rearrange
+from einops.layers.torch import Rearrange
+
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
 # helper functions
 
@@ -13,25 +16,122 @@ def exists(v):
     return v is not None
 
 def default(v, d):
-    return v if v is not None else d
+    return v if exists(v) else d
+
+def divisible_by(n, d):
+    return (n % d) == 0
 
 def LinearNoBias(dim, dim_out):
     return Linear(dim, dim_out, bias = False)
 
+def LayerNormNoParams(dim):
+    return LayerNorm(dim, elementwise_affine = False)
+
 # classes
+
+class LinearAttention(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        heads,
+        dim_queries_keys,
+        dim_values,
+        qk_activation = nn.ReLU()
+    ):
+        super().__init__()
+        dim_inner_qk = dim_queries_keys * heads
+        dim_inner_values = dim_values * heads
+
+        self.prenorm = LayerNormNoParams(dim)
+
+        self.to_qk = LinearNoBias(dim, dim_inner_qk)
+        self.to_v = LinearNoBias(dim, dim_inner_values)
+
+        self.qk_activation = qk_activation
+
+        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+        self.to_out = LinearNoBias(dim_inner_values, dim)
+
+    def forward(
+        self,
+        tokens,
+        rotary_emb = None
+    ):
+        device = tokens.device
+
+        tokens = self.prenorm(tokens)
+
+        # queries and keys, relu activated
+
+        q = k = self.to_qk(tokens)
+        q, k = map(self.qk_activation, (q, k))
+
+        # value
+
+        v = self.to_v(tokens)
+
+        # split
+
+        q, k, v = (self.split_heads(t) for t in (q, k, v))
+
+        # relative positions
+
+        if exists(rotary_emb):
+            q, k = (apply_rotary_emb(rotary_emb, t) for t in (q, k))
+
+        # linear attention, omitting attention to self
+
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
+
+        i, j = sim.shape[-2:]
+        causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).tril(-1) # omit self, seen in Reformer shared qk attention years ago
+
+        attn = sim.masked_fill(~causal_mask, 0.)
+
+        agg = einsum('b h i j, b h j d -> b h i d', attn, v)
+
+        # out
+
+        out = self.merge_heads(agg)
+
+        return self.to_out(out)
 
 class BDH(Module):
     def __init__(
         self,
         *,
         dim,
-        num_tokens
+        num_tokens,
+        depth = 8,
+        heads = 4,
+        dim_qk_heads = 32_768 # their neurons is the dim_qk * heads
     ):
         super().__init__()
-        self.token_embed = Embedding(dim, num_tokens)
+        assert divisible_by(dim_qk_heads, heads)
+        dim_qk = dim_qk_heads // heads
+
+        assert divisible_by(dim, heads)
+        dim_v = dim // heads
+
+        self.token_embed = Embedding(num_tokens, dim)
+
+        self.rope = RotaryEmbedding(dim_qk // 2)
+        self.depth = depth
+
+        self.postnorm = LayerNormNoParams(dim)
+
+        self.layer = LinearAttention(
+            dim,
+            heads = heads,
+            dim_queries_keys = dim_qk,
+            dim_values = dim_v
+        )
 
         self.to_logits = Sequential(
-            RMSNorm(dim),
+            LayerNormNoParams(dim),
             LinearNoBias(dim, num_tokens)
         )
 
@@ -41,7 +141,18 @@ class BDH(Module):
     ):
         tokens = self.token_embed(ids)
 
+        seq_len, device = tokens.shape[-2], tokens.device
+
+        seq = torch.arange(seq_len, device = device)
+
+        pos_emb = self.rope(seq)
+
+        for _ in range(self.depth):
+            layer_out = self.layer(tokens, pos_emb)
+            tokens = self.postnorm(tokens + layer_out)
+
         logits = self.to_logits(tokens)
+        return logits
 
 # quick test
 
