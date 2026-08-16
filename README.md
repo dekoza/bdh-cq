@@ -1,5 +1,5 @@
 
-# BDH-CQ (wip)
+## BDH-CQ (wip)
 
 Implementation of <a href="https://arxiv.org/abs/2608.09888">BDH-CQ: In-Context Learning with Recurrent Latent Reasoning</a>, proposed by Pathway Research
 
