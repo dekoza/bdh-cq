@@ -44,8 +44,6 @@ class BDHBlock(Module):
         dim_inner_qk = dim_queries_keys * heads
         dim_inner_values = dim_values * heads
 
-        self.pre_norm = LayerNormNoParams(dim)
-
         self.to_qk = LinearNoBias(dim, dim_inner_qk)
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
@@ -62,8 +60,6 @@ class BDHBlock(Module):
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
         self.proj_out = LinearNoBias(dim_queries_keys * heads, dim)
 
-        self.post_norm = LayerNormNoParams(dim)
-
     def forward(
         self,
         tokens,
@@ -73,19 +69,17 @@ class BDHBlock(Module):
     ):
         device = tokens.device
 
-        normed_tokens = self.pre_norm(tokens)
-
         # queries and keys, relu activated
 
-        sparse_input = self.qk_activation(self.to_qk(normed_tokens))
+        sparse_input = self.qk_activation(self.to_qk(tokens))
 
         # split heads
 
         q = k = ff_gates = self.split_heads(sparse_input)
 
-        # the values are the normed tokens
+        # the values are the tokens
 
-        v = normed_tokens
+        v = tokens
 
         # relative positions
 
