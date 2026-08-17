@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import torch
 from torch import nn, einsum
-import torch.nn.functional as F
-from torch.nn import Module, ModuleList, Embedding, Linear, LayerNorm, Sequential, Parameter
+from torch.nn import Module, Embedding, Linear, LayerNorm, Sequential, Parameter
 
-from einops import rearrange
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
@@ -36,13 +34,11 @@ class BDHBlock(Module):
         *,
         heads,
         dim_queries_keys,
-        dim_values,
         qk_activation = nn.ReLU(),
         ff_activation = nn.ReLU(),
     ):
         super().__init__()
         dim_inner_qk = dim_queries_keys * heads
-        dim_inner_values = dim_values * heads
 
         self.to_qk = LinearNoBias(dim, dim_inner_qk)
 
@@ -144,9 +140,6 @@ class BDH(Module):
         assert divisible_by(dim_qk_heads, heads)
         dim_qk = dim_qk_heads // heads
 
-        assert divisible_by(dim, heads)
-        dim_v = dim // heads
-
         self.token_embed = Embedding(num_tokens, dim)
 
         self.rope = RotaryEmbedding(dim_qk // 2)
@@ -157,16 +150,12 @@ class BDH(Module):
         self.block = BDHBlock(
             dim,
             heads = heads,
-            dim_queries_keys = dim_qk,
-            dim_values = dim_v
+            dim_queries_keys = dim_qk
         )
 
         self.post_norm = LayerNormNoParams(dim)
 
-        self.to_logits = Sequential(
-            LayerNormNoParams(dim),
-            LinearNoBias(dim, num_tokens)
-        )
+        self.to_logits = LinearNoBias(dim, num_tokens)
 
     def forward(
         self,
@@ -178,9 +167,16 @@ class BDH(Module):
 
         seq_len, depth, device = tokens.shape[-2], self.depth, tokens.device
 
+        # destruct memories
+
+        tokens_seen = 0
+
+        if exists(memories):
+            tokens_seen, _, memories = memories
+
         # positions
 
-        seq = torch.arange(seq_len, device = device)
+        seq = torch.arange(seq_len, device = device) + tokens_seen
 
         pos_emb = self.rope(seq)
 
@@ -212,7 +208,9 @@ class BDH(Module):
         if not return_memory:
             return logits
 
-        return logits, next_memories
+        next_tokens_seen = tokens_seen + seq_len
+
+        return logits, (next_tokens_seen, tokens, next_memories)
 
 # quick test
 

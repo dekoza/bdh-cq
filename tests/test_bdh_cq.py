@@ -17,5 +17,4 @@ def test_bdh_cq():
     logits, memories = model(ids, return_memory = True)
     logits2 = model(ids, memories = memories)
 
-    assert len(memories) == model.depth
     assert logits2.shape == logits.shape
