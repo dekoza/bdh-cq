@@ -47,6 +47,8 @@ class BDHBlock(Module):
 
         self.post_attn_norm = LayerNormNoParams(dim)
 
+        self.post_ff_norm = LayerNormNoParams(dim)
+
         # the feedforward part
 
         self.proj_up = Parameter(torch.randn(heads, dim, dim_queries_keys) * 0.02)
@@ -117,6 +119,8 @@ class BDHBlock(Module):
 
         out = self.proj_out(out)
 
+        out = self.post_ff_norm(out)
+
         # maybe return memories
 
         if not return_memories:
@@ -145,7 +149,7 @@ class BDH(Module):
         self.rope = RotaryEmbedding(dim_qk // 2)
         self.depth = depth
 
-        self.pre_norm = LayerNormNoParams(dim)
+        self.post_embed_norm = LayerNormNoParams(dim)
 
         self.block = BDHBlock(
             dim,
@@ -164,6 +168,8 @@ class BDH(Module):
         return_memory = False
     ):
         tokens = self.token_embed(ids)
+
+        tokens = self.post_embed_norm(tokens)
 
         seq_len, depth, device = tokens.shape[-2], self.depth, tokens.device
 
@@ -190,9 +196,7 @@ class BDH(Module):
         for _ in range(depth):
             prev_memory = next(memories, None)
 
-            normed = self.pre_norm(tokens)
-
-            block_out, layer_memory = self.block(normed, memories = prev_memory, rotary_emb = pos_emb, return_memories = True)
+            block_out, layer_memory = self.block(tokens, memories = prev_memory, rotary_emb = pos_emb, return_memories = True)
 
             tokens = self.post_norm(tokens + block_out)
 
