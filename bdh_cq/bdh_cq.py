@@ -332,7 +332,10 @@ class BDHReasoningWrapper(Module):
                 # every latent token predicts the first token of this next segment
 
                 num_unlabeled = len(latent_logits) - num_labeled_latents
-                latent_labels.append(repeat(item[:, :1], 'b 1 -> b n', n = num_unlabeled))
+
+                if not item.is_floating_point():
+                    latent_labels.append(repeat(item[:, :1], 'b 1 -> b n', n = num_unlabeled))
+
                 num_labeled_latents = len(latent_logits)
 
                 logits, memories = self.bdh(item, memories = memories, return_memory = True)
@@ -348,18 +351,17 @@ class BDHReasoningWrapper(Module):
 
         assert not isinstance(last(args), int), 'latent reasoning cannot be the final stage'
 
-        # every latent token predicts the first token of the next segment; the final segment predicts its own tokens
+        # every latent token predicts the first token of the next segment; each answer position predicts the next answer token
 
-        labels = last_tensor
+        all_logits = logits[:, :-1]
+        labels = last_tensor[:, 1:]
 
         if latent_logits:
             latent_logits = cat(latent_logits, dim = 1)
             latent_labels = cat(latent_labels, dim = 1)
 
-            all_logits = cat((latent_logits, logits), dim = 1)
-            labels = cat((latent_labels, last_tensor), dim = 1)
-        else:
-            all_logits = logits
+            all_logits = cat((latent_logits, all_logits), dim = 1)
+            labels = cat((latent_labels, labels), dim = 1)
 
         loss = F.cross_entropy(
             rearrange(all_logits, 'b n l -> b l n'),
