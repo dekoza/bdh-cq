@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList, Embedding, Linear, LayerNorm, Sequential, RMSNorm
+from torch.nn import Module, ModuleList, Embedding, Linear, LayerNorm, Sequential, Parameter
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
@@ -29,7 +29,7 @@ def LayerNormNoParams(dim):
 
 # classes
 
-class LinearAttention(Module):
+class BDHBlock(Module):
     def __init__(
         self,
         dim,
@@ -37,23 +37,32 @@ class LinearAttention(Module):
         heads,
         dim_queries_keys,
         dim_values,
-        qk_activation = nn.ReLU()
+        qk_activation = nn.ReLU(),
+        ff_activation = nn.ReLU(),
     ):
         super().__init__()
         dim_inner_qk = dim_queries_keys * heads
         dim_inner_values = dim_values * heads
 
-        self.prenorm = LayerNormNoParams(dim)
+        self.pre_norm = LayerNormNoParams(dim)
 
         self.to_qk = LinearNoBias(dim, dim_inner_qk)
-        self.to_v = LinearNoBias(dim, dim_inner_values)
-
-        self.qk_activation = qk_activation
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
-        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+        self.qk_activation = qk_activation
 
-        self.to_out = LinearNoBias(dim_inner_values, dim)
+        self.post_attn_norm = LayerNormNoParams(dim)
+
+        # the feedforward part
+
+        self.proj_up = Parameter(torch.randn(heads, dim, dim_queries_keys) * 0.02)
+
+        self.ff_act = ff_activation
+
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+        self.proj_out = LinearNoBias(dim_queries_keys * heads, dim)
+
+        self.post_norm = LayerNormNoParams(dim)
 
     def forward(
         self,
@@ -64,20 +73,19 @@ class LinearAttention(Module):
     ):
         device = tokens.device
 
-        tokens = self.prenorm(tokens)
+        normed_tokens = self.pre_norm(tokens)
 
         # queries and keys, relu activated
 
-        q = k = self.to_qk(tokens)
-        q, k = map(self.qk_activation, (q, k))
+        sparse_input = self.qk_activation(self.to_qk(normed_tokens))
 
-        # value
+        # split heads
 
-        v = self.to_v(tokens)
+        q = k = ff_gates = self.split_heads(sparse_input)
 
-        # split
+        # the values are the normed tokens
 
-        q, k, v = (self.split_heads(t) for t in (q, k, v))
+        v = normed_tokens
 
         # relative positions
 
@@ -93,7 +101,9 @@ class LinearAttention(Module):
 
         attn = sim.masked_fill(~causal_mask, 0.)
 
-        agg = einsum('b h i j, b h j d -> b h i d', attn, v)
+        # they directly aggregate on the tokens as the values, no projection
+
+        agg = einsum('b h i j, b j d -> b h i d', attn, v)
 
         # past memories
 
@@ -101,16 +111,28 @@ class LinearAttention(Module):
             retrieved = einsum('b h n d, b h d e -> b h n e', q, memories)
             agg = agg + retrieved
 
-        # out
+        # post attn norm
 
-        out = self.merge_heads(agg)
+        attn_out = self.post_attn_norm(agg)
 
-        out = self.to_out(out)
+        # the interesting ff glu variant
+
+        projected = einsum('b h n d, h d e -> b h n e', attn_out, self.proj_up)
+
+        # they use the projected sparse input itself (q, k) as the gates
+
+        projected = self.ff_act(projected * ff_gates)
+
+        out = self.merge_heads(projected)
+
+        out = self.proj_out(out)
+
+        # maybe return memories
 
         if not return_memories:
             return out
 
-        memories = einsum('b h n d, b h n e -> b h d e', k, v)
+        memories = einsum('b h n d, b n e -> b h d e', k, v)
 
         return out, memories
 
@@ -136,14 +158,16 @@ class BDH(Module):
         self.rope = RotaryEmbedding(dim_qk // 2)
         self.depth = depth
 
-        self.postnorm = LayerNormNoParams(dim)
+        self.pre_norm = LayerNormNoParams(dim)
 
-        self.layer = LinearAttention(
+        self.block = BDHBlock(
             dim,
             heads = heads,
             dim_queries_keys = dim_qk,
             dim_values = dim_v
         )
+
+        self.post_norm = LayerNormNoParams(dim)
 
         self.to_logits = Sequential(
             LayerNormNoParams(dim),
@@ -174,11 +198,16 @@ class BDH(Module):
         # layers
 
         for _ in range(depth):
-            layer_out, layer_memory = self.layer(tokens, memories = next(memories, None), rotary_emb = pos_emb, return_memories = True)
+            prev_memory = next(memories, None)
 
-            tokens = self.postnorm(tokens + layer_out)
+            normed = self.pre_norm(tokens)
 
-            next_memories.append(layer_memory)
+            block_out, layer_memory = self.block(normed, memories = prev_memory, rotary_emb = pos_emb, return_memories = True)
+
+            tokens = self.post_norm(tokens + block_out)
+
+            next_memory = layer_memory + default(prev_memory, 0.)
+            next_memories.append(next_memory)
 
         # readout
 

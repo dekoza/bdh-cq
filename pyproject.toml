@@ -1,6 +1,6 @@
 [project]
 name = "bdh-cq"
-version = "0.0.3"
+version = "0.0.4"
 description = "Implementation of BDH-CQ: In-Context Learning with Recurrent Latent Reasoning, proposed by Pathway Research"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -35,7 +35,10 @@ Homepage = "https://pypi.org/project/bdh-cq/"
 Repository = "https://github.com/lucidrains/bdh-cq"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "datasets",
+    "tqdm"
+]
 test = [
     "pytest"
 ]
@@ -48,6 +51,12 @@ pythonpath = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "datasets>=5.0.1",
+    "tqdm>=4.70.0",
+]
 
 [tool.hatch.build]
 include = [
