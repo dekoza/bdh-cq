@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import namedtuple
 
 import torch
 from torch import nn, einsum
@@ -7,6 +8,10 @@ from torch.nn import Module, Embedding, Linear, LayerNorm, Sequential, Parameter
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+
+# constants
+
+Memory = namedtuple('Memory', ('tokens_seen', 'embeds', 'fast_weight_memories'))
 
 # helper functions
 
@@ -163,13 +168,25 @@ class BDH(Module):
 
     def forward(
         self,
-        ids,
+        tokens_or_ids,
         memories = None,
-        return_memory = False
+        return_memory = False,
+        return_logits = True
     ):
-        tokens = self.token_embed(ids)
 
-        tokens = self.post_embed_norm(tokens)
+        # the input can be tokens, from last forward, for recurrent latent reasoning
+
+        tokens = tokens_or_ids if tokens_or_ids.is_floating_point() else None
+
+        # usual token embed if the input is not floating point
+
+        if not exists(tokens):
+
+            tokens = self.token_embed(tokens_or_ids)
+
+            tokens = self.post_embed_norm(tokens)
+
+        # variables
 
         seq_len, depth, device = tokens.shape[-2], self.depth, tokens.device
 
@@ -205,7 +222,7 @@ class BDH(Module):
 
         # readout
 
-        logits = self.to_logits(tokens)
+        logits = self.to_logits(tokens) if return_logits else None
 
         # return
 
@@ -214,7 +231,7 @@ class BDH(Module):
 
         next_tokens_seen = tokens_seen + seq_len
 
-        return logits, (next_tokens_seen, tokens, next_memories)
+        return logits, Memory(next_tokens_seen, tokens, next_memories)
 
 # quick test
 

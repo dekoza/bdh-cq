@@ -13,13 +13,16 @@ $ pip install bdh-cq
 
 ```python
 import torch
-from bdh_cq import BDHCQ
+from bdh_cq import BDH
 
-model = BDHCQ()
+model = BDH(
+    dim = 512,
+    num_tokens = 20_000
+)
 
-ids = torch.randn(2, 1024)
+ids = torch.randint(0, 20_000, (2, 1024))
 
-logits = model(ids)
+logits = model(ids) # (2, 1024, 20_000)
 ```
 
 ## Citations
