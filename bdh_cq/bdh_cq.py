@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import nn, einsum
+from torch import nn, einsum, is_tensor
 from torch.nn import Module, Embedding, Linear, LayerNorm, Sequential, Parameter
 
 from einops.layers.torch import Rearrange
@@ -20,6 +20,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def first(v):
+    return v[0]
 
 def divisible_by(n, d):
     return (n % d) == 0
@@ -235,6 +238,49 @@ class BDH(Module):
         next_tokens_seen = tokens_seen + seq_len
 
         return logits, Memory(next_tokens_seen, tokens, next_memories)
+
+# reasoning wrapper for interleaved parallel token ingestion and recurrent latent reasoning
+
+class BDHReasoningWrapper(Module):
+    def __init__(self, bdh: BDH):
+        super().__init__()
+        self.bdh = bdh
+
+    def forward(
+        self,
+        *args,
+        memories: Memory | None = None,
+        return_memory = False,
+        update_memory = False
+    ):
+        # allow for passing a single list or tuple of inputs
+
+        if len(args) == 1 and isinstance(first(args), (list, tuple)):
+            args = first(args)
+
+        # loop through parallel tokens and latent reasoning steps
+
+        logits = None
+
+        for item in args:
+
+            # latent reasoning step
+
+            if isinstance(item, int):
+                assert exists(memories), 'must ingest tokens before latent reasoning'
+
+                for _ in range(item):
+                    latent = memories.embeds[..., -1:, :]
+                    _, memories = self.bdh(latent, memories = memories, return_memory = True, return_logits = False, update_memory = update_memory)
+
+            # parallel tokens
+
+            elif is_tensor(item):
+                logits, memories = self.bdh(item, memories = memories, return_memory = True)
+
+        # return
+
+        return (logits, memories) if return_memory else logits
 
 # quick test
 
