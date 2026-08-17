@@ -2,9 +2,11 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import nn, einsum, is_tensor
+from torch import nn, einsum, cat, is_tensor
 from torch.nn import Module, Embedding, Linear, LayerNorm, Sequential, Parameter
+import torch.nn.functional as F
 
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
@@ -23,6 +25,9 @@ def default(v, d):
 
 def first(v):
     return v[0]
+
+def last(v):
+    return v[-1]
 
 def divisible_by(n, d):
     return (n % d) == 0
@@ -152,6 +157,7 @@ class BDH(Module):
         assert divisible_by(dim_qk_heads, heads)
         dim_qk = dim_qk_heads // heads
 
+        self.dim = dim
         self.token_embed = Embedding(num_tokens, dim)
 
         self.rope = RotaryEmbedding(dim_qk // 2)
@@ -242,16 +248,51 @@ class BDH(Module):
 # reasoning wrapper for interleaved parallel token ingestion and recurrent latent reasoning
 
 class BDHReasoningWrapper(Module):
-    def __init__(self, bdh: BDH):
+    def __init__(
+        self,
+        bdh: BDH,
+        ignore_index = -1,
+        max_reasoning_steps = 8,
+        ramp_fraction = 0.25
+    ):
         super().__init__()
         self.bdh = bdh
+        self.ignore_index = ignore_index
+        self.max_reasoning_steps = max_reasoning_steps
+        self.ramp_fraction = ramp_fraction
+
+    def pick_reasoning_steps(
+        self,
+        step,
+        steps,
+        max_reasoning_steps = None,
+        ramp_fraction = None
+    ):
+        """latent steps per training step (paper sec. 7): ramps up then
+        uniform, so every effort level is trained on and can be chosen at
+        inference; 0 skips the latent recurrence"""
+
+        max_reasoning_steps = default(max_reasoning_steps, self.max_reasoning_steps)
+        ramp_fraction = default(ramp_fraction, self.ramp_fraction)
+
+        if max_reasoning_steps <= 0:
+            return 0
+
+        progress = step / steps
+
+        if progress < ramp_fraction:
+            return int(round(max_reasoning_steps * progress / ramp_fraction))
+
+        return torch.randint(0, max_reasoning_steps + 1, (1,)).item()
 
     def forward(
         self,
         *args,
         memories: Memory | None = None,
+        return_loss = False,
         return_memory = False,
-        update_memory = False
+        update_memory = False,
+        weight: Tensor | None = None
     ):
         # allow for passing a single list or tuple of inputs
 
@@ -261,26 +302,76 @@ class BDHReasoningWrapper(Module):
         # loop through parallel tokens and latent reasoning steps
 
         logits = None
+        last_tensor = None
+
+        latent_logits = []
+        latent_labels = []
+        num_labeled_latents = 0
 
         for item in args:
 
-            # latent reasoning step
+            # latent reasoning step, each step projected to predict the first token of the next segment
 
             if isinstance(item, int):
                 assert exists(memories), 'must ingest tokens before latent reasoning'
 
+                latent = memories.embeds[..., -1:, :]
+
                 for _ in range(item):
-                    latent = memories.embeds[..., -1:, :]
                     _, memories = self.bdh(latent, memories = memories, return_memory = True, return_logits = False, update_memory = update_memory)
+                    latent = memories.embeds
+
+                    latent_logits_ = self.bdh.to_logits(latent)
+                    latent_logits.append(latent_logits_)
 
             # parallel tokens
 
             elif is_tensor(item):
+                last_tensor = item
+
+                # every latent token predicts the first token of this next segment
+
+                num_unlabeled = len(latent_logits) - num_labeled_latents
+                latent_labels.append(repeat(item[:, :1], 'b 1 -> b n', n = num_unlabeled))
+                num_labeled_latents = len(latent_logits)
+
                 logits, memories = self.bdh(item, memories = memories, return_memory = True)
 
         # return
 
-        return (logits, memories) if return_memory else logits
+        if not return_loss:
+            return (logits, memories) if return_memory else logits
+
+        assert exists(logits), 'a tensor stage must follow the latent reasoning'
+
+        # never leave latent reasoning dangling at the very end
+
+        assert not isinstance(last(args), int), 'latent reasoning cannot be the final stage'
+
+        # every latent token predicts the first token of the next segment; the final segment predicts its own tokens
+
+        labels = last_tensor
+
+        if latent_logits:
+            latent_logits = cat(latent_logits, dim = 1)
+            latent_labels = cat(latent_labels, dim = 1)
+
+            all_logits = cat((latent_logits, logits), dim = 1)
+            labels = cat((latent_labels, last_tensor), dim = 1)
+        else:
+            all_logits = logits
+
+        loss = F.cross_entropy(
+            rearrange(all_logits, 'b n l -> b l n'),
+            labels,
+            ignore_index = self.ignore_index,
+            weight = weight
+        )
+
+        if return_memory:
+            return loss, logits, memories
+
+        return loss
 
 # quick test
 

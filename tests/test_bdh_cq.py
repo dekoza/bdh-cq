@@ -71,3 +71,106 @@ def test_bdh_reasoning_wrapper():
 
     assert ans_logits.shape == (1, 20, 16)
     assert memories.tokens_seen == (10 + 2 + 15 + 4 + 20)
+
+def test_bdh_reasoning_wrapper_return_loss():
+
+    model = BDH(
+        dim = 512,
+        num_tokens = 16,
+        dim_qk_heads = 2048,
+        depth = 2
+    )
+
+    wrapper = BDHReasoningWrapper(model)
+
+    prompts = torch.randint(0, 16, (2, 20))
+    answers = torch.randint(0, 16, (2, 30))
+
+    loss, logits, memories = wrapper(prompts, 8, answers, return_loss = True, return_memory = True)
+
+    assert logits.shape == (2, 30, 16)
+
+    loss.backward()
+
+def test_bdh_reasoning_wrapper_loss_without_latent():
+
+    model = BDH(
+        dim = 512,
+        num_tokens = 16,
+        dim_qk_heads = 2048,
+        depth = 2
+    )
+
+    wrapper = BDHReasoningWrapper(model)
+
+    prompts = torch.randint(0, 16, (2, 20))
+    answers = torch.randint(0, 16, (2, 30))
+
+    loss = wrapper(prompts, 0, answers, return_loss = True)
+
+    loss.backward()
+
+def test_bdh_reasoning_wrapper_loss_predicts_next_segment_first_token():
+
+    # no answer targets: every latent token still predicts the first token
+    # of the next tensor segment
+
+    model = BDH(
+        dim = 512,
+        num_tokens = 16,
+        dim_qk_heads = 2048,
+        depth = 2
+    )
+
+    wrapper = BDHReasoningWrapper(model)
+
+    p1 = torch.randint(0, 16, (2, 20))
+    p2 = torch.randint(0, 16, (2, 30))
+
+    loss = wrapper(p1, 8, p2, return_loss = True)
+
+    loss.backward()
+
+def test_bdh_reasoning_wrapper_loss_interleaved():
+
+    # p1, 4 latent, p2, 5 latent, answer: each latent section predicts the
+    # first token of the segment that follows it
+
+    model = BDH(
+        dim = 512,
+        num_tokens = 16,
+        dim_qk_heads = 2048,
+        depth = 2
+    )
+
+    wrapper = BDHReasoningWrapper(model)
+
+    p1 = torch.randint(0, 16, (2, 10))
+    p2 = torch.randint(0, 16, (2, 15))
+    answer = torch.randint(0, 16, (2, 20))
+
+    loss, logits, memories = wrapper(p1, 4, p2, 5, answer, return_loss = True, return_memory = True)
+
+    assert memories.tokens_seen == (10 + 4 + 15 + 5 + 20)
+    assert logits.shape == (2, 20, 16)
+
+    loss.backward()
+
+def test_bdh_reasoning_wrapper_trailing_latent_rejected():
+
+    model = BDH(
+        dim = 512,
+        num_tokens = 16,
+        dim_qk_heads = 2048,
+        depth = 2
+    )
+
+    wrapper = BDHReasoningWrapper(model)
+
+    prompts = torch.randint(0, 16, (2, 20))
+
+    try:
+        wrapper(prompts, 8, return_loss = True)
+        assert False, 'trailing latent reasoning should be rejected'
+    except AssertionError:
+        pass
