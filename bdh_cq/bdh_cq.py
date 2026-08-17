@@ -171,7 +171,8 @@ class BDH(Module):
         tokens_or_ids,
         memories = None,
         return_memory = False,
-        return_logits = True
+        return_logits = True,
+        update_memory = True
     ):
 
         # the input can be tokens, from last forward, for recurrent latent reasoning
@@ -217,7 +218,9 @@ class BDH(Module):
 
             tokens = self.post_norm(tokens + block_out)
 
-            next_memory = layer_memory + default(prev_memory, 0.)
+            # update the memory, but allow for it to be controlled with `update_memory` kwarg, section 3.3 suggests they kept the past memory constant during the latent recurrent iterations
+
+            next_memory = layer_memory + default(prev_memory, 0.) if update_memory else prev_memory
             next_memories.append(next_memory)
 
         # readout

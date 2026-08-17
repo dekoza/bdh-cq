@@ -34,8 +34,8 @@ def test_bdh_cq_latent_reasoning():
 
     latent = memories.embeds[..., -1:, :]
     for _ in range(8):
-        _, memories = model(latent, memories = memories, return_memory = True, return_logits = False)
-        latent = memories.embeds[..., -1:, :]
+        _, memories = model(latent, memories = memories, return_memory = True, return_logits = False, update_memory = False)
+        latent = memories.embeds
 
     answer_logits = model(answers, memories = memories)
 
