@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import nn, einsum, cat, stack, is_tensor, Tensor
+from torch import nn, einsum, cat, stack, is_tensor, Tensor, zeros
 from torch.nn import Module, Embedding, Linear, LayerNorm, RMSNorm, Parameter
 import torch.nn.functional as F
 
@@ -41,6 +41,49 @@ def LinearNoBias(dim, dim_out):
 def LayerNormNoParams(dim):
     return LayerNorm(dim, elementwise_affine = False)
 
+# attention residual depth bias
+# each latent key is biased on its sim by its distance from the end of reasoning
+
+def compute_attn_residual_depth_bias(
+    num_keys,
+    *,
+    bias_schedule,
+    depth,
+    total_reasoning_iterations
+):
+    total_latents = depth * total_reasoning_iterations
+    device = bias_schedule.device
+
+    # no reasoning cycles, nothing to be away from the end of
+
+    if total_latents == 0:
+        return zeros(num_keys, device = device)
+
+    # biases are indexed by distance from the end of reasoning, one per cycle, repeated across the depths,
+    # curtailed to the cycles that will exist, earlier cycles zero padded on the left, and the tail excised
+    # by the depth still to go before the end
+
+    if bias_schedule.numel() > total_reasoning_iterations:
+        bias_schedule = bias_schedule[-total_reasoning_iterations:]
+
+    schedule = repeat(bias_schedule, 'd -> (d depth)', depth = depth)
+
+    if schedule.numel() < total_latents:
+        schedule = cat((zeros(total_latents - schedule.numel(), device = device), schedule))
+
+    num_latents = num_keys - 1
+
+    if num_latents > total_latents:
+        # latents written after reasoning concludes are the most final, keep the maximum bias
+
+        schedule = cat((schedule, repeat(schedule[-1:], '1 -> n', n = num_latents - total_latents)))
+    else:
+        schedule = schedule[:num_latents]
+
+    # the seed latents precede reasoning, no bias
+
+    return cat((zeros(1, device = device), schedule))
+
 # residual
 
 class AttentionResidual(Module):
@@ -50,17 +93,26 @@ class AttentionResidual(Module):
         self,
         dim,
         *,
-        depth = 1
+        depth = 1,
+        depth_bias_distance = 0
     ):
         super().__init__()
         self.query = Parameter(torch.randn(depth, dim) * 0.02)
         self.key_rmsnorm = RMSNorm(dim)
 
+        # bias on the sim by distance from the end of reasoning, off at 0
+
+        self.has_depth_bias_distance = depth_bias_distance > 0
+        if self.has_depth_bias_distance:
+            self.depth_bias = Parameter(torch.randn(depth_bias_distance) * 0.02)
+
     def forward(
         self,
         query,
         keys_values: list[Tensor],
-        layer_index = 0
+        layer_index = 0,
+        depth = 1,
+        total_reasoning_iterations = 1
     ):
         keys_values = list(keys_values)
 
@@ -71,6 +123,19 @@ class AttentionResidual(Module):
         queries, keys = self.query[layer_index], self.key_rmsnorm(past_layers)
 
         sim = einsum('d, b n l d -> b n l', queries, keys)
+
+        # latent aware of its distance from the end of reasoning
+
+        if self.has_depth_bias_distance:
+            depth_bias = compute_attn_residual_depth_bias(
+                len(keys_values),
+                bias_schedule = self.depth_bias,
+                depth = depth,
+                total_reasoning_iterations = total_reasoning_iterations
+            )
+
+            sim = sim + depth_bias
+
         attn = sim.softmax(dim = -1)
 
         return einsum('b n l, b n l d -> b n d', attn, past_layers)
@@ -193,6 +258,7 @@ class BDH(Module):
         dim_qk_heads = 32_768, # their neurons is the dim_qk * heads
         attn_residual = False,
         attn_residual_tied = True,
+        attn_residual_depth_bias_distance = 0,
     ):
         super().__init__()
         assert divisible_by(dim_qk_heads, heads)
@@ -221,7 +287,7 @@ class BDH(Module):
 
         self.attn_residual_tied = attn_residual_tied
 
-        self.attn_residual = AttentionResidual(dim, depth = depth if attn_residual and not attn_residual_tied else 1) if attn_residual else None
+        self.attn_residual = AttentionResidual(dim, depth = depth if attn_residual and not attn_residual_tied else 1, depth_bias_distance = attn_residual_depth_bias_distance) if attn_residual else None
 
     def forward(
         self,
@@ -231,8 +297,10 @@ class BDH(Module):
         return_logits = True,
         update_memory = True,
         return_per_pass_hiddens = False,
-        all_block_outputs = None
+        all_block_outputs = None,
+        total_reasoning_iterations = 1
     ):
+        device = tokens_or_ids.device
 
         # attention residual wired in through the flag on init
 
@@ -252,7 +320,7 @@ class BDH(Module):
 
         # variables
 
-        seq_len, depth, device = tokens.shape[-2], self.depth, tokens.device
+        seq_len, depth = tokens.shape[-2], self.depth
 
         # the initial token embeddings can be attention residual-ed
 
@@ -300,7 +368,13 @@ class BDH(Module):
 
                 query_index = 0 if self.attn_residual_tied else layer_index
 
-                readout = attention_residual(tokens, all_block_outputs, layer_index = query_index)
+                readout = attention_residual(
+                    tokens,
+                    all_block_outputs,
+                    layer_index = query_index,
+                    depth = depth,
+                    total_reasoning_iterations = total_reasoning_iterations
+                )
 
                 tokens = readout
             else:
@@ -316,7 +390,11 @@ class BDH(Module):
 
             # the memory update can be frozen with `update_memory` (section 3.3)
 
-            next_memory = layer_memory + default(prev_memory, 0.) if update_memory else prev_memory
+            if update_memory:
+                next_memory = layer_memory + default(prev_memory, 0.)
+            else:
+                next_memory = prev_memory
+
             next_memories.append(next_memory)
 
         # post norm, applied once
@@ -379,6 +457,10 @@ class BDHReasoningWrapper(Module):
 
         all_block_outputs = None
 
+        # attention residual latents are aware of their distance from the end of reasoning
+
+        total_reasoning_iterations = sum(stage for stage in args if isinstance(stage, int))
+
         for item in args:
 
             # latent reasoning step, each step projected to predict the first token of the next segment
@@ -394,7 +476,7 @@ class BDHReasoningWrapper(Module):
                     all_block_outputs = [latent]
 
                 for _ in range(item):
-                    _, memories = self.bdh(latent, memories = memories, return_memory = True, return_logits = False, update_memory = update_memory, all_block_outputs = all_block_outputs)
+                    _, memories = self.bdh(latent, memories = memories, return_memory = True, return_logits = False, update_memory = update_memory, all_block_outputs = all_block_outputs, total_reasoning_iterations = total_reasoning_iterations)
 
                     latent = memories.embeds
 
@@ -416,7 +498,9 @@ class BDHReasoningWrapper(Module):
 
                     num_labeled_latents = len(latent_logits)
 
-                logits, memories = self.bdh(item, memories = memories, return_memory = True)
+                # the depth bias applies only to the latent reasoning steps, never the parallel token passes
+
+                logits, memories = self.bdh(item, memories = memories, return_memory = True, total_reasoning_iterations = 0)
 
         # return
 
