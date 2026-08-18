@@ -174,3 +174,31 @@ def test_bdh_reasoning_wrapper_trailing_latent_rejected():
         assert False, 'trailing latent reasoning should be rejected'
     except AssertionError:
         pass
+
+def test_bdh_attn_residual_recycling():
+
+    # pass the same sequence in again, attended over the previous pass's per-layer hiddens, alphafold2 style recycling
+
+    model = BDH(
+        dim = 512,
+        num_tokens = 16,
+        dim_qk_heads = 2048,
+        depth = 2,
+        attn_residual = True
+    )
+
+    tokens = torch.randint(0, 16, (1, 10))
+
+    logits, _, per_pass_hiddens = model(tokens, return_memory = True, return_per_pass_hiddens = True)
+    recycled = model(tokens, all_block_outputs = per_pass_hiddens)
+
+    assert logits.shape == (1, 10, 16)
+    assert recycled.shape == (1, 10, 16)
+
+    # mismatched sequence length must be rejected
+
+    try:
+        model(tokens[:, :-1], all_block_outputs = per_pass_hiddens)
+        assert False
+    except AssertionError:
+        pass

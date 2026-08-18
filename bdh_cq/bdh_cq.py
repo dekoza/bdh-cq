@@ -2,8 +2,8 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import nn, einsum, cat, is_tensor
-from torch.nn import Module, Embedding, Linear, LayerNorm, Sequential, Parameter
+from torch import nn, einsum, cat, stack, is_tensor, Tensor
+from torch.nn import Module, Embedding, Linear, LayerNorm, RMSNorm, Parameter
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
@@ -32,11 +32,48 @@ def last(v):
 def divisible_by(n, d):
     return (n % d) == 0
 
+def pop_if_len_one(returns):
+    return returns[0] if len(returns) == 1 else returns
+
 def LinearNoBias(dim, dim_out):
     return Linear(dim, dim_out, bias = False)
 
 def LayerNormNoParams(dim):
     return LayerNorm(dim, elementwise_affine = False)
+
+# residual
+
+class AttentionResidual(Module):
+    # attention over the depth axis with a learnable pseudo-query, replacing the identity residual - Kimi team https://arxiv.org/abs/2603.15031
+
+    def __init__(
+        self,
+        dim,
+        *,
+        depth = 1
+    ):
+        super().__init__()
+        self.query = Parameter(torch.randn(depth, dim) * 0.02)
+        self.key_rmsnorm = RMSNorm(dim)
+
+    def forward(
+        self,
+        query,
+        keys_values: list[Tensor],
+        layer_index = 0
+    ):
+        keys_values = list(keys_values)
+
+        assert all(hidden.shape == query.shape for hidden in keys_values), f'layer hiddens must all match the query shape ({query.shape}), got {[h.shape for h in keys_values]}'
+
+        past_layers = rearrange(keys_values, 'l b n d -> b n l d')
+
+        queries, keys = self.query[layer_index], self.key_rmsnorm(past_layers)
+
+        sim = einsum('d, b n l d -> b n l', queries, keys)
+        attn = sim.softmax(dim = -1)
+
+        return einsum('b n l, b n l d -> b n d', attn, past_layers)
 
 # classes
 
@@ -143,6 +180,8 @@ class BDHBlock(Module):
 
         return out, memories
 
+# main bdh
+
 class BDH(Module):
     def __init__(
         self,
@@ -151,7 +190,9 @@ class BDH(Module):
         num_tokens,
         depth = 8,
         heads = 4,
-        dim_qk_heads = 32_768 # their neurons is the dim_qk * heads
+        dim_qk_heads = 32_768, # their neurons is the dim_qk * heads
+        attn_residual = False,
+        attn_residual_tied = True,
     ):
         super().__init__()
         assert divisible_by(dim_qk_heads, heads)
@@ -175,14 +216,27 @@ class BDH(Module):
 
         self.to_logits = LinearNoBias(dim, num_tokens)
 
+        # attention residual, defined once - a single pseudo-query attends over all depth x step latent hiddens,
+        # or a distinct pseudo-query per depth when untied
+
+        self.attn_residual_tied = attn_residual_tied
+
+        self.attn_residual = AttentionResidual(dim, depth = depth if attn_residual and not attn_residual_tied else 1) if attn_residual else None
+
     def forward(
         self,
         tokens_or_ids,
         memories = None,
         return_memory = False,
         return_logits = True,
-        update_memory = True
+        update_memory = True,
+        return_per_pass_hiddens = False,
+        all_block_outputs = None
     ):
+
+        # attention residual wired in through the flag on init
+
+        attention_residual = self.attn_residual
 
         # the input can be tokens, from last forward, for recurrent latent reasoning
 
@@ -199,6 +253,14 @@ class BDH(Module):
         # variables
 
         seq_len, depth, device = tokens.shape[-2], self.depth, tokens.device
+
+        # the initial token embeddings can be attention residual-ed
+
+        if exists(attention_residual):
+            if is_tensor(all_block_outputs):
+                all_block_outputs = [all_block_outputs]
+
+            all_block_outputs = default(all_block_outputs, [tokens])
 
         # destruct memories
 
@@ -218,19 +280,48 @@ class BDH(Module):
         memories = iter(default(memories, (None,) * depth))
         next_memories = []
 
+        per_pass_hiddens = []
+
         # layers
 
-        for _ in range(depth):
+        for layer_index in range(depth):
             prev_memory = next(memories, None)
+
+            # bdh layer forward
 
             block_out, layer_memory = self.block(tokens, memories = prev_memory, rotary_emb = pos_emb, return_memories = True)
 
-            tokens = self.post_norm(tokens + block_out)
+            # residual
 
-            # update the memory, but allow for it to be controlled with `update_memory` kwarg, section 3.3 suggests they kept the past memory constant during the latent recurrent iterations
+            if exists(attention_residual):
+                all_block_outputs.append(block_out)
+
+                # the attention readout over the block outputs replaces the identity residual (paper eq. 5)
+
+                query_index = 0 if self.attn_residual_tied else layer_index
+
+                readout = attention_residual(tokens, all_block_outputs, layer_index = query_index)
+
+                tokens = readout
+            else:
+                # normal identity residual
+
+                tokens = tokens + block_out
+
+            # for latent reasoning steps being able to attention residual back across reasoning steps
+            # in my experiments, much more stable at 8 reasoning steps, the usual identity way collapses, sans knowing their secretive latent transition function.
+
+            if return_per_pass_hiddens:
+                per_pass_hiddens.append(tokens)
+
+            # the memory update can be frozen with `update_memory` (section 3.3)
 
             next_memory = layer_memory + default(prev_memory, 0.) if update_memory else prev_memory
             next_memories.append(next_memory)
+
+        # post norm, applied once
+
+        tokens = self.post_norm(tokens)
 
         # readout
 
@@ -238,12 +329,15 @@ class BDH(Module):
 
         # return
 
-        if not return_memory:
-            return logits
+        returns = (logits,)
 
-        next_tokens_seen = tokens_seen + seq_len
+        if return_memory:
+            returns += (Memory(tokens_seen + seq_len, tokens, next_memories),)
 
-        return logits, Memory(next_tokens_seen, tokens, next_memories)
+        if return_per_pass_hiddens:
+            returns += (per_pass_hiddens,)
+
+        return pop_if_len_one(returns)
 
 # reasoning wrapper for interleaved parallel token ingestion and recurrent latent reasoning
 
@@ -251,39 +345,11 @@ class BDHReasoningWrapper(Module):
     def __init__(
         self,
         bdh: BDH,
-        ignore_index = -1,
-        max_reasoning_steps = 8,
-        ramp_fraction = 0.25
+        ignore_index = -1
     ):
         super().__init__()
         self.bdh = bdh
         self.ignore_index = ignore_index
-        self.max_reasoning_steps = max_reasoning_steps
-        self.ramp_fraction = ramp_fraction
-
-    def pick_reasoning_steps(
-        self,
-        step,
-        steps,
-        max_reasoning_steps = None,
-        ramp_fraction = None
-    ):
-        """latent steps per training step (paper sec. 7): ramps up then
-        uniform, so every effort level is trained on and can be chosen at
-        inference; 0 skips the latent recurrence"""
-
-        max_reasoning_steps = default(max_reasoning_steps, self.max_reasoning_steps)
-        ramp_fraction = default(ramp_fraction, self.ramp_fraction)
-
-        if max_reasoning_steps <= 0:
-            return 0
-
-        progress = step / steps
-
-        if progress < ramp_fraction:
-            return int(round(max_reasoning_steps * progress / ramp_fraction))
-
-        return torch.randint(0, max_reasoning_steps + 1, (1,)).item()
 
     def forward(
         self,
@@ -308,6 +374,11 @@ class BDHReasoningWrapper(Module):
         latent_labels = []
         num_labeled_latents = 0
 
+        # the block outputs are aggregated across the reasoning chain and re-fed to the attention residual during
+        # the latent steps, seeded with the initial token embeddings (paper: v_0 = h_1), which persist as the first key
+
+        all_block_outputs = None
+
         for item in args:
 
             # latent reasoning step, each step projected to predict the first token of the next segment
@@ -317,33 +388,45 @@ class BDHReasoningWrapper(Module):
 
                 latent = memories.embeds[..., -1:, :]
 
+                # seed the aggregate with the initial token embeddings, once
+
+                if not exists(all_block_outputs):
+                    all_block_outputs = [latent]
+
                 for _ in range(item):
-                    _, memories = self.bdh(latent, memories = memories, return_memory = True, return_logits = False, update_memory = update_memory)
+                    _, memories = self.bdh(latent, memories = memories, return_memory = True, return_logits = False, update_memory = update_memory, all_block_outputs = all_block_outputs)
+
                     latent = memories.embeds
 
-                    latent_logits_ = self.bdh.to_logits(latent)
-                    latent_logits.append(latent_logits_)
+                    if return_loss:
+                        latent_logits.append(self.bdh.to_logits(latent))
 
             # parallel tokens
 
             elif is_tensor(item):
                 last_tensor = item
 
-                # every latent token predicts the first token of this next segment
+                if return_loss:
+                    # every latent token predicts the first token of this next segment
 
-                num_unlabeled = len(latent_logits) - num_labeled_latents
+                    num_unlabeled = len(latent_logits) - num_labeled_latents
 
-                if not item.is_floating_point():
-                    latent_labels.append(repeat(item[:, :1], 'b 1 -> b n', n = num_unlabeled))
+                    if not item.is_floating_point():
+                        latent_labels.append(repeat(item[:, :1], 'b 1 -> b n', n = num_unlabeled))
 
-                num_labeled_latents = len(latent_logits)
+                    num_labeled_latents = len(latent_logits)
 
                 logits, memories = self.bdh(item, memories = memories, return_memory = True)
 
         # return
 
         if not return_loss:
-            return (logits, memories) if return_memory else logits
+            returns = (logits,)
+
+            if return_memory:
+                returns += (memories,)
+
+            return pop_if_len_one(returns)
 
         assert exists(logits), 'a tensor stage must follow the latent reasoning'
 
@@ -363,6 +446,8 @@ class BDHReasoningWrapper(Module):
             all_logits = cat((latent_logits, all_logits), dim = 1)
             labels = cat((latent_labels, labels), dim = 1)
 
+        # loss
+
         loss = F.cross_entropy(
             rearrange(all_logits, 'b n l -> b l n'),
             labels,
@@ -370,10 +455,14 @@ class BDHReasoningWrapper(Module):
             weight = weight
         )
 
-        if return_memory:
-            return loss, logits, memories
+        # returns
 
-        return loss
+        returns = (loss,)
+
+        if return_memory:
+            returns += (logits, memories)
+
+        return pop_if_len_one(returns)
 
 # quick test
 
